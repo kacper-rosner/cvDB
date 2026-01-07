@@ -7,7 +7,7 @@ canClient BOOLEAN DEFAULT TRUE);
 
 CREATE TABLE server.Website (    
 websiteName VARCHAR(255) PRIMARY KEY,    
-htmlPath azure_url,    
-cssPath azure_url,    
+htmlPath azure_url NOT NULL,    
+cssPath azure_url NOT NULL,    
 czContent azure_url,    
 plContent azure_url);
