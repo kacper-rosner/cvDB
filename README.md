@@ -11,7 +11,7 @@ database for cv creator app
 ## TODO
 
 wdrożyć serverScheme - zmiana z not null
-
+do tabeli z rodzajami kont trzeba dodać do 'Client' 'university' (Nullable), do 'Recruiter', 'business'
 
 <img width="563" height="529" alt="image" src="https://github.com/user-attachments/assets/4ed7e044-cd9e-4072-8887-c8268594ce2c" />
 
