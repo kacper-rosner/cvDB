@@ -1,4 +1,4 @@
--- 1. PRZYGOTOWANIE SCHEMATÓW I DOMEN
+
 SET client_encoding TO 'UTF8';
 CREATE SCHEMA IF NOT EXISTS users;
 CREATE SCHEMA IF NOT EXISTS jobs;
@@ -7,8 +7,7 @@ CREATE SCHEMA IF NOT EXISTS server;
 
 CREATE DOMAIN azure_url AS VARCHAR(500) CHECK (VALUE ~ '^azure\.database\.com/.*');
 
--- 2. TABELE NADRZĘDNE (POZIOM 0)
--- Tabele, które nie posiadają kluczy obcych do innych tabel.
+
 CREATE TABLE server.IPWhitelist (    
     ip INET PRIMARY KEY,    
     canConsole BOOLEAN DEFAULT FALSE,    
@@ -51,8 +50,7 @@ CREATE TABLE jobs.JobDict (
     UNIQUE(title_en, skill_en) 
 );
 
--- 3. TABELE ZALEŻNE (POZIOM 1)
--- Odwołują się do tabel z punktu 2.
+
 CREATE TABLE users.AccountTypeWebsite (
     accountType VARCHAR(50) PRIMARY KEY,
     websiteName VARCHAR(255) REFERENCES server.Website(websiteName)
@@ -73,8 +71,6 @@ CREATE TABLE users.User (
      FOREIGN KEY (language, theme) REFERENCES users.Themes(language, theme)
 );
 
--- 4. TABELE ZALEŻNE (POZIOM 2)
--- Odwołują się do tabeli users.User lub JobDict.
 CREATE TABLE server.Logs (
     date DATE NOT NULL,
     "user" VARCHAR(255) REFERENCES users.User(login),
@@ -124,8 +120,6 @@ CREATE TABLE jobs.JobsCZ (
     countT2 INT DEFAULT 0
 );
 
--- 5. TABELE ZALEŻNE (POZIOM 3)
--- Odwołują się do tabel z poziomu 2 (Documents).
 CREATE TABLE files.DocumentPerms (    
     pid INT PRIMARY KEY,    
     did INT REFERENCES files.Documents(did) ON UPDATE CASCADE ON DELETE CASCADE,    
