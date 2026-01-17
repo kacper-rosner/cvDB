@@ -1,6 +1,9 @@
 # cvDB
 database for cv creator app
 
+\d (files||jobs||users||server).*
+
+
 ## Kolejnosc 
 1. Scheme
 2. implementation
