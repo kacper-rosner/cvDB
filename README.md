@@ -25,5 +25,6 @@ do tabeli z rodzajami kont trzeba dodać do 'Client' 'university' (Nullable), do
 <img width="683" height="438" alt="image" src="https://github.com/user-attachments/assets/27de9eb6-9170-4a05-af5b-b878190450a0" />
 
 
+<img width="1483" height="696" alt="image" src="https://github.com/user-attachments/assets/a2ab120b-63cb-4a3c-83fe-e29e6f79066b" />
 
 
