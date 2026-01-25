@@ -648,4 +648,49 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION jobs.get_top_popular_jobs(
+  p_skill_name varchar,
+  p_country varchar,
+  p_period varchar,
+  p_limit int
+)
+RETURNS TABLE (
+  job_id int,
+  job_title varchar,
+  skill_name varchar,
+  count_value int
+) AS $$
+DECLARE
+  v_c text := lower(p_country);
+  v_p text := upper(p_period);
+BEGIN
+  IF v_p IS NULL OR v_p = '' THEN
+    v_p := jobs.get_latest_period_code(v_c);
+  END IF;
+
+  RETURN QUERY
+  SELECT 
+    jd.jobid,
+    COALESCE(jt.local_title, jd.title_en),
+    COALESCE(jt.local_skill, jd.skill_en),
+    CASE 
+      WHEN v_c IN ('pl', 'poland') AND v_p = 'T0' THEN jp.countt0
+      WHEN v_c IN ('pl', 'poland') AND v_p = 'T1' THEN jp.countt1
+      WHEN v_c IN ('pl', 'poland') AND v_p = 'T2' THEN jp.countt2
+      WHEN v_c IN ('cz', 'czech', 'czechia') AND v_p = 'T0' THEN jc.countt0
+      WHEN v_c IN ('cz', 'czech', 'czechia') AND v_p = 'T1' THEN jc.countt1
+      WHEN v_c IN ('cz', 'czech', 'czechia') AND v_p = 'T2' THEN jc.countt2
+      ELSE 0
+    END
+  FROM jobs.jobdict jd
+  LEFT JOIN jobs.jobtranslations jt ON jd.jobid = jt.jobid
+  LEFT JOIN jobs.jobspl jp ON jd.jobid = jp.jobid
+  LEFT JOIN jobs.jobscz jc ON jd.jobid = jc.jobid
+  WHERE jd.skill_en ILIKE p_skill_name
+  ORDER BY 4 DESC
+  LIMIT CASE WHEN p_limit > 0 THEN p_limit ELSE NULL END;
+END;
+$$ LANGUAGE plpgsql;
+
+
 COMMIT;
