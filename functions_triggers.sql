@@ -628,4 +628,24 @@ AFTER INSERT OR UPDATE OR DELETE ON jobs.jobtranslations
 FOR EACH ROW
 EXECUTE FUNCTION server.fn_audit_log();
 
+CREATE OR REPLACE FUNCTION jobs.get_latest_period_code(p_country text)
+RETURNS text AS $$
+DECLARE
+  v_table text;
+  v_latest_col text;
+BEGIN
+  v_table := CASE WHEN lower(p_country) IN ('pl', 'poland') THEN 'jobspl' ELSE 'jobscz' END;
+
+  SELECT column_name INTO v_latest_col
+  FROM information_schema.columns
+  WHERE table_schema = 'jobs' 
+    AND table_name = v_table 
+    AND column_name LIKE 'countt%'
+  ORDER BY substring(column_name FROM '[0-9]+')::int DESC
+  LIMIT 1;
+
+  RETURN upper(substring(v_latest_col FROM 'countt(.*)'));
+END;
+$$ LANGUAGE plpgsql;
+
 COMMIT;
