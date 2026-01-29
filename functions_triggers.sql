@@ -790,4 +790,39 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION jobs.upsert_jobdict(
+    p_title_en text,
+    p_skill_en text,
+    p_local_title text,
+    p_local_skill text,
+    p_language text 
+)
+RETURNS int AS $$
+DECLARE
+    v_jobid int;
+BEGIN
+    SELECT jobid INTO v_jobid 
+    FROM jobs.jobdict 
+    WHERE title_en ~* ('^\s*' || p_title_en || '\s*$')
+      AND skill_en ~* ('^\s*' || p_skill_en || '\s*$')
+      AND language = p_language  
+    LIMIT 1;
+
+     IF v_jobid IS NULL THEN
+        INSERT INTO jobs.jobdict (title_en, skill_en, language)
+        VALUES (btrim(p_title_en), btrim(p_skill_en), p_language)
+        RETURNING jobid INTO v_jobid;
+    END IF;
+
+   INSERT INTO jobs.jobtranslations (jobid, local_title, local_skill)
+    VALUES (v_jobid, btrim(p_local_title), btrim(p_local_skill))
+    ON CONFLICT (jobid) DO UPDATE 
+    SET local_title = EXCLUDED.local_title,
+        local_skill = EXCLUDED.local_skill;
+
+    RETURN v_jobid;
+END;
+$$ LANGUAGE plpgsql;
+
+
 COMMIT;
