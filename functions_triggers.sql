@@ -823,5 +823,21 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION jobs.get_en_by_local(p_title text, p_skill text)
+ RETURNS TABLE(title_en character varying, skill_en character varying)
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  RETURN QUERY
+  SELECT jd.title_en, jd.skill_en
+  FROM jobs.jobdict jd
+  JOIN jobs.jobtranslations jt USING (jobid)
+  WHERE jt.local_title ~* ('^\s*' || p_title || '\s*$')
+    AND jt.local_skill ~* ('^\s*' || p_skill || '\s*$');
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Nie znaleziono tlumaczenia dla: %, %', p_title, p_skill;
+  END IF;
+END;
 
 COMMIT;
