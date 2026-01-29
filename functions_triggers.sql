@@ -840,4 +840,33 @@ BEGIN
   END IF;
 END;
 
+CREATE OR REPLACE FUNCTION users.fn_validate_search_distance()
+RETURNS trigger AS $$
+DECLARE
+    v_max_dist int;
+BEGIN
+    SELECT r.maxdistance INTO v_max_dist
+    FROM users.regions r
+    WHERE r.country = NEW.country
+      AND r.region = NEW.region;
+
+    IF v_max_dist IS NULL THEN
+        RAISE EXCEPTION 'Region % w kraju % nie istnieje', NEW.region, NEW.country;
+    END IF;
+
+    IF NOT (NEW.distance < v_max_dist) THEN
+        RAISE EXCEPTION 'Dystans (%) musi byc mniejszy niz limit regionu (%)', 
+            NEW.distance, v_max_dist;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_users_validate_search_distance ON users.usersearchsettings;
+CREATE TRIGGER trg_users_validate_search_distance
+BEFORE INSERT OR UPDATE OF distance, country, region ON users.usersearchsettings
+FOR EACH ROW
+EXECUTE FUNCTION users.fn_validate_search_distance();
+
 COMMIT;
