@@ -693,4 +693,101 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+CREATE OR REPLACE FUNCTION jobs.get_stats_by_text(
+  p_title_en text,
+  p_skill_en text,
+  p_country text
+)
+RETURNS TABLE (
+  job_id int,
+  title_en varchar,
+  skill_en varchar,
+  t0_count int,
+  t1_count int,
+  t2_count int
+) AS $$
+DECLARE
+  v_c text := lower(p_country);
+BEGIN
+  RETURN QUERY
+  SELECT 
+    jd.jobid,
+    jd.title_en,
+    jd.skill_en,
+
+    CASE WHEN v_c IN ('pl', 'poland') THEN jp.countt0 ELSE jc.countt0 END,
+    CASE WHEN v_c IN ('pl', 'poland') THEN jp.countt1 ELSE jc.countt1 END,
+    CASE WHEN v_c IN ('pl', 'poland') THEN jp.countt2 ELSE jc.countt2 END
+  FROM jobs.jobdict jd
+
+  LEFT JOIN jobs.jobspl jp ON jd.jobid = jp.jobid
+  LEFT JOIN jobs.jobscz jc ON jd.jobid = jc.jobid
+
+  WHERE jd.title_en ~* ('^\s*' || p_title_en || '\s*$')
+    AND jd.skill_en ~* ('^\s*' || p_skill_en || '\s*$')
+
+    AND (
+      (v_c IN ('pl', 'poland') AND jp.jobid IS NOT NULL) OR
+      (v_c IN ('cz', 'czech', 'czechia') AND jc.jobid IS NOT NULL)
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION jobs.bump_counter_auto(
+   p_country text,
+   p_title_en text,
+   p_skill_en text,
+   p_bucket text,
+   p_amount int DEFAULT 1
+)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+   v_bucket text := upper(p_bucket);
+   v_country text := lower(p_country);
+   v_jobid int;
+BEGIN
+
+   SELECT jobid INTO v_jobid
+   FROM jobs.jobdict
+   WHERE title_en ~* ('^\s*' || p_title_en || '\s*$')
+     AND skill_en ~* ('^\s*' || p_skill_en || '\s*$');
+
+   IF v_jobid IS NULL THEN
+     RAISE EXCEPTION 'Job with title % and skill % not found', p_title_en, p_skill_en;
+   END IF;
+
+   IF v_bucket NOT IN ('T0','T1','T2') THEN
+     RAISE EXCEPTION 'bucket must be T0, T1 or T2';
+   END IF;
+
+   IF v_country IN ('pl','poland') THEN
+     IF v_bucket = 'T0' THEN
+       UPDATE jobs.jobspl SET countt0 = countt0 + p_amount WHERE jobid = v_jobid;
+     ELSIF v_bucket = 'T1' THEN
+       UPDATE jobs.jobspl SET countt1 = countt1 + p_amount WHERE jobid = v_jobid;
+     ELSE
+       UPDATE jobs.jobspl SET countt2 = countt2 + p_amount WHERE jobid = v_jobid;
+     END IF;
+
+   ELSIF v_country IN ('cz','czech','czechia') THEN
+     IF v_bucket = 'T0' THEN
+       UPDATE jobs.jobscz SET countt0 = countt0 + p_amount WHERE jobid = v_jobid;
+     ELSIF v_bucket = 'T1' THEN
+       UPDATE jobs.jobscz SET countt1 = countt1 + p_amount WHERE jobid = v_jobid;
+     ELSE
+       UPDATE jobs.jobscz SET countt2 = countt2 + p_amount WHERE jobid = v_jobid;
+     END IF;
+
+   ELSE
+     RAISE EXCEPTION 'Unknown country: % (use pl/cz)', p_country;
+   END IF;
+
+   IF NOT FOUND THEN
+     RAISE EXCEPTION 'Job counters row not found for country % and ID %', p_country, v_jobid;
+   END IF;
+END;
+$$;
+
 COMMIT;
