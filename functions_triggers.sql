@@ -1,0 +1,872 @@
+BEGIN;
+
+INSERT INTO files.permissions(permissionlevel, read_perm, delete_perm, share_perm)
+VALUES
+  (1, TRUE,  FALSE, FALSE),
+  (2, TRUE,  TRUE,  FALSE),
+  (3, TRUE,  TRUE,  TRUE)
+ON CONFLICT (permissionlevel) DO NOTHING;
+
+INSERT INTO users.themes(language, theme)
+VALUES
+  ('EN', 'DARK'),
+  ('EN', 'LIGHT')
+ON CONFLICT (language, theme) DO NOTHING;
+
+DO $$
+DECLARE
+  v_site varchar;
+BEGIN
+  SELECT w.websitename INTO v_site
+  FROM server.website w
+  ORDER BY w.websitename
+  LIMIT 1;
+
+  IF v_site IS NULL THEN
+    RAISE EXCEPTION 'Cannot seed users.accounttypewebsite: server.website is empty (no websitename to reference).';
+  END IF;
+
+  INSERT INTO users.accounttypewebsite(accounttype, websitename)
+  VALUES
+    ('STUDENT', v_site),
+    ('COMPANY', v_site)
+  ON CONFLICT (accounttype) DO NOTHING;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION users.fn_hash_password()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'INSERT'
+     OR (TG_OP = 'UPDATE' AND NEW.password IS DISTINCT FROM OLD.password) THEN
+    NEW.salt := md5(random()::text || clock_timestamp()::text || NEW.login::text);
+    NEW.password := md5(NEW.password || NEW.salt);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_users_hash_password ON users."user";
+CREATE TRIGGER trg_users_hash_password
+BEFORE INSERT OR UPDATE OF password ON users."user"
+FOR EACH ROW
+EXECUTE FUNCTION users.fn_hash_password();
+
+CREATE OR REPLACE FUNCTION users.fn_block_login_change()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.login IS DISTINCT FROM OLD.login THEN
+    RAISE EXCEPTION 'Changing login is not allowed';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_users_block_login_change ON users."user";
+CREATE TRIGGER trg_users_block_login_change
+BEFORE UPDATE OF login ON users."user"
+FOR EACH ROW
+EXECUTE FUNCTION users.fn_block_login_change();
+
+CREATE OR REPLACE FUNCTION users.register_user(
+  p_login varchar,
+  p_password_plain varchar,
+  p_age int,
+  p_university varchar,
+  p_nationality varchar,
+  p_isworking boolean,
+  p_ishiring boolean,
+  p_accounttype varchar,
+  p_language varchar,
+  p_theme varchar
+)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF p_login IS NULL OR btrim(p_login) = '' THEN
+    RAISE EXCEPTION 'Login cannot be empty';
+  END IF;
+
+  IF p_password_plain IS NULL OR btrim(p_password_plain) = '' THEN
+    RAISE EXCEPTION 'Password cannot be empty';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM users."user" u WHERE u.login = p_login) THEN
+    RAISE EXCEPTION 'User with login % already exists', p_login;
+  END IF;
+
+  IF (p_language IS NOT NULL AND p_theme IS NULL)
+     OR (p_language IS NULL AND p_theme IS NOT NULL) THEN
+    RAISE EXCEPTION 'Both language and theme must be provided together';
+  END IF;
+
+  IF p_accounttype IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM users.accounttypewebsite a WHERE a.accounttype = p_accounttype
+  ) THEN
+    RAISE EXCEPTION 'Unknown accounttype: %', p_accounttype;
+  END IF;
+
+  IF (p_language IS NOT NULL AND p_theme IS NOT NULL) AND NOT EXISTS (
+    SELECT 1 FROM users.themes t WHERE t.language = p_language AND t.theme = p_theme
+  ) THEN
+    RAISE EXCEPTION 'Unknown language/theme pair: %, %', p_language, p_theme;
+  END IF;
+
+  INSERT INTO users."user"(
+    login, password, age, university, nationality,
+    isworking, ishiring, accounttype, language, theme
+  )
+  VALUES (
+    p_login,
+    p_password_plain,
+    p_age,
+    p_university,
+    p_nationality,
+    COALESCE(p_isworking, FALSE),
+    COALESCE(p_ishiring, FALSE),
+    p_accounttype,
+    p_language,
+    p_theme
+  );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION users.check_login(
+  p_login varchar,
+  p_password_plain varchar
+)
+RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_salt varchar;
+  v_hash varchar;
+BEGIN
+  SELECT u.salt, u.password
+  INTO v_salt, v_hash
+  FROM users."user" u
+  WHERE u.login = p_login;
+
+  IF v_salt IS NULL OR v_hash IS NULL THEN
+    RETURN FALSE;
+  END IF;
+
+  RETURN v_hash = md5(p_password_plain || v_salt);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION files.has_permission(
+  p_login varchar,
+  p_did int,
+  p_action text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_owner varchar;
+  v_level int;
+  v_read boolean;
+  v_delete boolean;
+  v_share boolean;
+  v_action text := lower(coalesce(p_action,''));
+BEGIN
+  SELECT d.owner INTO v_owner
+  FROM files.documents d
+  WHERE d.did = p_did;
+
+  IF NOT FOUND THEN
+    RETURN FALSE;
+  END IF;
+
+  IF v_owner IS NOT NULL AND p_login = v_owner THEN
+    RETURN TRUE;
+  END IF;
+
+  SELECT dp.permissionlevel INTO v_level
+  FROM files.documentperms dp
+  WHERE dp.did = p_did AND dp.login = p_login
+  ORDER BY dp.pid
+  LIMIT 1;
+
+  IF v_level IS NULL THEN
+    RETURN FALSE;
+  END IF;
+
+  SELECT p.read_perm, p.delete_perm, p.share_perm
+  INTO v_read, v_delete, v_share
+  FROM files.permissions p
+  WHERE p.permissionlevel = v_level;
+
+  IF v_action = 'read' THEN
+    RETURN COALESCE(v_read, FALSE);
+  ELSIF v_action = 'delete' THEN
+    RETURN COALESCE(v_delete, FALSE);
+  ELSIF v_action = 'share' THEN
+    RETURN COALESCE(v_share, FALSE);
+  ELSE
+    RAISE EXCEPTION 'Unknown action: % (use read/delete/share)', p_action;
+  END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION files.grant_permission(
+  p_grantor varchar,
+  p_did int,
+  p_target_login varchar,
+  p_permissionlevel int
+)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_owner varchar;
+  v_grantor_level int;
+  v_new_pid int;
+BEGIN
+  SELECT d.owner INTO v_owner
+  FROM files.documents d
+  WHERE d.did = p_did;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Document % not found', p_did;
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM users."user" u WHERE u.login = p_target_login) THEN
+    RAISE EXCEPTION 'Target user % not found', p_target_login;
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM files.permissions p WHERE p.permissionlevel = p_permissionlevel) THEN
+    RAISE EXCEPTION 'Permission level % does not exist', p_permissionlevel;
+  END IF;
+
+  IF v_owner IS NULL OR p_grantor <> v_owner THEN
+    IF NOT files.has_permission(p_grantor, p_did, 'share') THEN
+      RAISE EXCEPTION 'User % has no share permission for document %', p_grantor, p_did;
+    END IF;
+
+    SELECT dp.permissionlevel INTO v_grantor_level
+    FROM files.documentperms dp
+    WHERE dp.did = p_did AND dp.login = p_grantor
+    ORDER BY dp.pid
+    LIMIT 1;
+
+    IF v_grantor_level IS NULL THEN
+      RAISE EXCEPTION 'Grantor % has no permission record for document %', p_grantor, p_did;
+    END IF;
+
+    IF p_permissionlevel > v_grantor_level THEN
+      RAISE EXCEPTION 'Grantor % cannot grant higher level (%) than their own (%)',
+        p_grantor, p_permissionlevel, v_grantor_level;
+    END IF;
+  END IF;
+
+  UPDATE files.documentperms
+  SET permissionlevel = p_permissionlevel
+  WHERE pid = (
+    SELECT pid
+    FROM files.documentperms
+    WHERE did = p_did AND login = p_target_login
+    ORDER BY pid
+    LIMIT 1
+  );
+
+  IF FOUND THEN
+    RETURN;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(hashtext('files.documentperms_pid'));
+  SELECT COALESCE(MAX(pid) + 1, 1) INTO v_new_pid FROM files.documentperms;
+
+  INSERT INTO files.documentperms(pid, did, login, permissionlevel)
+  VALUES (v_new_pid, p_did, p_target_login, p_permissionlevel);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION files.revoke_permission(
+  p_grantor varchar,
+  p_did int,
+  p_target_login varchar
+)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_owner varchar;
+BEGIN
+  SELECT d.owner INTO v_owner
+  FROM files.documents d
+  WHERE d.did = p_did;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Document % not found', p_did;
+  END IF;
+
+  IF v_owner IS NOT NULL AND p_target_login = v_owner THEN
+    RAISE EXCEPTION 'Cannot revoke permissions from document owner';
+  END IF;
+
+  IF v_owner IS NULL OR p_grantor <> v_owner THEN
+    IF NOT files.has_permission(p_grantor, p_did, 'share') THEN
+      RAISE EXCEPTION 'User % has no share permission for document %', p_grantor, p_did;
+    END IF;
+  END IF;
+
+  DELETE FROM files.documentperms
+  WHERE did = p_did AND login = p_target_login;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION files.fn_auto_owner_perms()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_max_level int;
+  v_new_pid int;
+BEGIN
+  IF NEW.owner IS NULL OR btrim(NEW.owner) = '' THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT MAX(permissionlevel) INTO v_max_level FROM files.permissions;
+  IF v_max_level IS NULL THEN
+    RAISE EXCEPTION 'No permission levels in files.permissions';
+  END IF;
+
+  UPDATE files.documentperms
+  SET permissionlevel = v_max_level
+  WHERE pid = (
+    SELECT pid
+    FROM files.documentperms
+    WHERE did = NEW.did AND login = NEW.owner
+    ORDER BY pid
+    LIMIT 1
+  );
+
+  IF FOUND THEN
+    RETURN NEW;
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(hashtext('files.documentperms_pid'));
+  SELECT COALESCE(MAX(pid) + 1, 1) INTO v_new_pid FROM files.documentperms;
+
+  INSERT INTO files.documentperms(pid, did, login, permissionlevel)
+  VALUES (v_new_pid, NEW.did, NEW.owner, v_max_level);
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_files_auto_owner_perms ON files.documents;
+CREATE TRIGGER trg_files_auto_owner_perms
+AFTER INSERT ON files.documents
+FOR EACH ROW
+EXECUTE FUNCTION files.fn_auto_owner_perms();
+
+CREATE OR REPLACE FUNCTION files.fn_validate_documentperms_change()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_actor varchar;
+  v_owner varchar;
+  v_actor_level int;
+BEGIN
+  v_actor := current_setting('app.user', true);
+
+  IF v_actor IS NULL OR v_actor = '' THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT d.owner INTO v_owner
+  FROM files.documents d
+  WHERE d.did = NEW.did;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Document % not found', NEW.did;
+  END IF;
+
+  IF v_owner IS NOT NULL AND v_actor = v_owner THEN
+    RETURN NEW;
+  END IF;
+
+  IF NOT files.has_permission(v_actor, NEW.did, 'share') THEN
+    RAISE EXCEPTION 'User % has no share permission for document %', v_actor, NEW.did;
+  END IF;
+
+  SELECT dp.permissionlevel INTO v_actor_level
+  FROM files.documentperms dp
+  WHERE dp.did = NEW.did AND dp.login = v_actor
+  ORDER BY dp.pid
+  LIMIT 1;
+
+  IF v_actor_level IS NULL THEN
+    RAISE EXCEPTION 'Actor % has no permission record for document %', v_actor, NEW.did;
+  END IF;
+
+  IF NEW.permissionlevel > v_actor_level THEN
+    RAISE EXCEPTION 'Actor % cannot grant higher level (%) than their own (%)',
+      v_actor, NEW.permissionlevel, v_actor_level;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_files_validate_documentperms ON files.documentperms;
+CREATE TRIGGER trg_files_validate_documentperms
+BEFORE INSERT OR UPDATE ON files.documentperms
+FOR EACH ROW
+EXECUTE FUNCTION files.fn_validate_documentperms_change();
+
+CREATE OR REPLACE FUNCTION jobs.bump_counter(
+  p_country text,
+  p_jobid int,
+  p_bucket text
+)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_bucket text := upper(p_bucket);
+  v_country text := lower(p_country);
+BEGIN
+  IF v_bucket NOT IN ('T0','T1','T2') THEN
+    RAISE EXCEPTION 'bucket must be T0, T1 or T2';
+  END IF;
+
+  IF v_country IN ('pl','poland') THEN
+    IF v_bucket = 'T0' THEN
+      UPDATE jobs.jobspl SET countt0 = countt0 + 1 WHERE jobid = p_jobid;
+    ELSIF v_bucket = 'T1' THEN
+      UPDATE jobs.jobspl SET countt1 = countt1 + 1 WHERE jobid = p_jobid;
+    ELSE
+      UPDATE jobs.jobspl SET countt2 = countt2 + 1 WHERE jobid = p_jobid;
+    END IF;
+
+  ELSIF v_country IN ('cz','czech','czechia') THEN
+    IF v_bucket = 'T0' THEN
+      UPDATE jobs.jobscz SET countt0 = countt0 + 1 WHERE jobid = p_jobid;
+    ELSIF v_bucket = 'T1' THEN
+      UPDATE jobs.jobscz SET countt1 = countt1 + 1 WHERE jobid = p_jobid;
+    ELSE
+      UPDATE jobs.jobscz SET countt2 = countt2 + 1 WHERE jobid = p_jobid;
+    END IF;
+
+  ELSE
+    RAISE EXCEPTION 'Unknown country: % (use pl/cz)', p_country;
+  END IF;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Job % counters row not found for country %', p_jobid, p_country;
+  END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION jobs.fn_create_job_counters()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  INSERT INTO jobs.jobspl(jobid, countt0, countt1, countt2)
+  VALUES (NEW.jobid, 0, 0, 0)
+  ON CONFLICT (jobid) DO NOTHING;
+
+  INSERT INTO jobs.jobscz(jobid, countt0, countt1, countt2)
+  VALUES (NEW.jobid, 0, 0, 0)
+  ON CONFLICT (jobid) DO NOTHING;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_jobs_create_counters ON jobs.jobdict;
+CREATE TRIGGER trg_jobs_create_counters
+AFTER INSERT ON jobs.jobdict
+FOR EACH ROW
+EXECUTE FUNCTION jobs.fn_create_job_counters();
+
+CREATE OR REPLACE FUNCTION jobs.fn_translation_fallback()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_title_en varchar;
+  v_skill_en varchar;
+BEGIN
+  SELECT jd.title_en, jd.skill_en
+  INTO v_title_en, v_skill_en
+  FROM jobs.jobdict jd
+  WHERE jd.jobid = NEW.jobid;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Job % not found in jobdict', NEW.jobid;
+  END IF;
+
+  IF NEW.local_title IS NULL OR btrim(NEW.local_title) = '' THEN
+    NEW.local_title := v_title_en;
+  END IF;
+
+  IF NEW.local_skill IS NULL OR btrim(NEW.local_skill) = '' THEN
+    NEW.local_skill := v_skill_en;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_jobs_translation_fallback ON jobs.jobtranslations;
+CREATE TRIGGER trg_jobs_translation_fallback
+BEFORE INSERT OR UPDATE ON jobs.jobtranslations
+FOR EACH ROW
+EXECUTE FUNCTION jobs.fn_translation_fallback();
+
+CREATE OR REPLACE FUNCTION server.is_ip_allowed(
+  p_ip inet,
+  p_scope text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_scope text := lower(p_scope);
+  v_canconsole boolean;
+  v_candb boolean;
+  v_canclient boolean;
+BEGIN
+  SELECT w.canconsole, w.candb, w.canclient
+  INTO v_canconsole, v_candb, v_canclient
+  FROM server.ipwhitelist w
+  WHERE w.ip = p_ip;
+
+  IF NOT FOUND THEN
+    RETURN FALSE;
+  END IF;
+
+  IF v_scope = 'console' THEN
+    RETURN COALESCE(v_canconsole, FALSE);
+  ELSIF v_scope = 'db' THEN
+    RETURN COALESCE(v_candb, FALSE);
+  ELSIF v_scope = 'client' THEN
+    RETURN COALESCE(v_canclient, FALSE);
+  ELSE
+    RAISE EXCEPTION 'Unknown scope: % (use console/db/client)', p_scope;
+  END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION server.fn_audit_log()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_actor text;
+  v_msg text;
+  v_op text;
+BEGIN
+  v_actor := current_setting('app.user', true);
+  IF v_actor IS NULL OR v_actor = '' THEN
+    v_actor := current_user;
+  END IF;
+
+  v_op := TG_OP;
+  v_msg := format('%s on %s', v_op, TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME);
+
+  INSERT INTO server.logs(date, "user", message, ip, type)
+  VALUES (current_date, v_actor, v_msg, inet_client_addr(), v_op)
+  ON CONFLICT (date, "user") DO UPDATE
+    SET message = left(
+                  CASE
+                    WHEN server.logs.message IS NULL OR btrim(server.logs.message) = '' THEN EXCLUDED.message
+                    ELSE server.logs.message || '; ' || EXCLUDED.message
+                  END,
+                  255
+                ),
+        ip = EXCLUDED.ip,
+        type = EXCLUDED.type;
+
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_audit_users_user ON users."user";
+CREATE TRIGGER trg_audit_users_user
+AFTER INSERT OR UPDATE OR DELETE ON users."user"
+FOR EACH ROW
+EXECUTE FUNCTION server.fn_audit_log();
+
+DROP TRIGGER IF EXISTS trg_audit_files_documents ON files.documents;
+CREATE TRIGGER trg_audit_files_documents
+AFTER INSERT OR UPDATE OR DELETE ON files.documents
+FOR EACH ROW
+EXECUTE FUNCTION server.fn_audit_log();
+
+DROP TRIGGER IF EXISTS trg_audit_files_documentperms ON files.documentperms;
+CREATE TRIGGER trg_audit_files_documentperms
+AFTER INSERT OR UPDATE OR DELETE ON files.documentperms
+FOR EACH ROW
+EXECUTE FUNCTION server.fn_audit_log();
+
+DROP TRIGGER IF EXISTS trg_audit_jobs_jobdict ON jobs.jobdict;
+CREATE TRIGGER trg_audit_jobs_jobdict
+AFTER INSERT OR UPDATE OR DELETE ON jobs.jobdict
+FOR EACH ROW
+EXECUTE FUNCTION server.fn_audit_log();
+
+DROP TRIGGER IF EXISTS trg_audit_jobs_jobtranslations ON jobs.jobtranslations;
+CREATE TRIGGER trg_audit_jobs_jobtranslations
+AFTER INSERT OR UPDATE OR DELETE ON jobs.jobtranslations
+FOR EACH ROW
+EXECUTE FUNCTION server.fn_audit_log();
+
+CREATE OR REPLACE FUNCTION jobs.get_latest_period_code(p_country text)
+RETURNS text AS $$
+DECLARE
+  v_table text;
+  v_latest_col text;
+BEGIN
+  v_table := CASE WHEN lower(p_country) IN ('pl', 'poland') THEN 'jobspl' ELSE 'jobscz' END;
+
+  SELECT column_name INTO v_latest_col
+  FROM information_schema.columns
+  WHERE table_schema = 'jobs' 
+    AND table_name = v_table 
+    AND column_name LIKE 'countt%'
+  ORDER BY substring(column_name FROM '[0-9]+')::int DESC
+  LIMIT 1;
+
+  RETURN upper(substring(v_latest_col FROM 'countt(.*)'));
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION jobs.get_top_popular_jobs(
+  p_skill_name varchar,
+  p_country varchar,
+  p_period varchar,
+  p_limit int
+)
+RETURNS TABLE (
+  job_id int,
+  job_title varchar,
+  skill_name varchar,
+  count_value int
+) AS $$
+DECLARE
+  v_c text := lower(p_country);
+  v_p text := upper(p_period);
+BEGIN
+  IF v_p IS NULL OR v_p = '' THEN
+    v_p := jobs.get_latest_period_code(v_c);
+  END IF;
+
+  RETURN QUERY
+  SELECT 
+    jd.jobid,
+    COALESCE(jt.local_title, jd.title_en),
+    COALESCE(jt.local_skill, jd.skill_en),
+    CASE 
+      WHEN v_c IN ('pl', 'poland') AND v_p = 'T0' THEN jp.countt0
+      WHEN v_c IN ('pl', 'poland') AND v_p = 'T1' THEN jp.countt1
+      WHEN v_c IN ('pl', 'poland') AND v_p = 'T2' THEN jp.countt2
+      WHEN v_c IN ('cz', 'czech', 'czechia') AND v_p = 'T0' THEN jc.countt0
+      WHEN v_c IN ('cz', 'czech', 'czechia') AND v_p = 'T1' THEN jc.countt1
+      WHEN v_c IN ('cz', 'czech', 'czechia') AND v_p = 'T2' THEN jc.countt2
+      ELSE 0
+    END
+  FROM jobs.jobdict jd
+  LEFT JOIN jobs.jobtranslations jt ON jd.jobid = jt.jobid
+  LEFT JOIN jobs.jobspl jp ON jd.jobid = jp.jobid
+  LEFT JOIN jobs.jobscz jc ON jd.jobid = jc.jobid
+  WHERE jd.skill_en ILIKE p_skill_name
+  ORDER BY 4 DESC
+  LIMIT CASE WHEN p_limit > 0 THEN p_limit ELSE NULL END;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION jobs.get_stats_by_text(
+  p_title_en text,
+  p_skill_en text,
+  p_country text
+)
+RETURNS TABLE (
+  job_id int,
+  title_en varchar,
+  skill_en varchar,
+  t0_count int,
+  t1_count int,
+  t2_count int
+) AS $$
+DECLARE
+  v_c text := lower(p_country);
+BEGIN
+  RETURN QUERY
+  SELECT 
+    jd.jobid,
+    jd.title_en,
+    jd.skill_en,
+
+    CASE WHEN v_c IN ('pl', 'poland') THEN jp.countt0 ELSE jc.countt0 END,
+    CASE WHEN v_c IN ('pl', 'poland') THEN jp.countt1 ELSE jc.countt1 END,
+    CASE WHEN v_c IN ('pl', 'poland') THEN jp.countt2 ELSE jc.countt2 END
+  FROM jobs.jobdict jd
+
+  LEFT JOIN jobs.jobspl jp ON jd.jobid = jp.jobid
+  LEFT JOIN jobs.jobscz jc ON jd.jobid = jc.jobid
+
+  WHERE jd.title_en ~* ('^\s*' || p_title_en || '\s*$')
+    AND jd.skill_en ~* ('^\s*' || p_skill_en || '\s*$')
+
+    AND (
+      (v_c IN ('pl', 'poland') AND jp.jobid IS NOT NULL) OR
+      (v_c IN ('cz', 'czech', 'czechia') AND jc.jobid IS NOT NULL)
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION jobs.bump_counter_auto(
+   p_country text,
+   p_title_en text,
+   p_skill_en text,
+   p_bucket text,
+   p_amount int DEFAULT 1
+)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+   v_bucket text := upper(p_bucket);
+   v_country text := lower(p_country);
+   v_jobid int;
+BEGIN
+
+   SELECT jobid INTO v_jobid
+   FROM jobs.jobdict
+   WHERE title_en ~* ('^\s*' || p_title_en || '\s*$')
+     AND skill_en ~* ('^\s*' || p_skill_en || '\s*$');
+
+   IF v_jobid IS NULL THEN
+     RAISE EXCEPTION 'Job with title % and skill % not found', p_title_en, p_skill_en;
+   END IF;
+
+   IF v_bucket NOT IN ('T0','T1','T2') THEN
+     RAISE EXCEPTION 'bucket must be T0, T1 or T2';
+   END IF;
+
+   IF v_country IN ('pl','poland') THEN
+     IF v_bucket = 'T0' THEN
+       UPDATE jobs.jobspl SET countt0 = countt0 + p_amount WHERE jobid = v_jobid;
+     ELSIF v_bucket = 'T1' THEN
+       UPDATE jobs.jobspl SET countt1 = countt1 + p_amount WHERE jobid = v_jobid;
+     ELSE
+       UPDATE jobs.jobspl SET countt2 = countt2 + p_amount WHERE jobid = v_jobid;
+     END IF;
+
+   ELSIF v_country IN ('cz','czech','czechia') THEN
+     IF v_bucket = 'T0' THEN
+       UPDATE jobs.jobscz SET countt0 = countt0 + p_amount WHERE jobid = v_jobid;
+     ELSIF v_bucket = 'T1' THEN
+       UPDATE jobs.jobscz SET countt1 = countt1 + p_amount WHERE jobid = v_jobid;
+     ELSE
+       UPDATE jobs.jobscz SET countt2 = countt2 + p_amount WHERE jobid = v_jobid;
+     END IF;
+
+   ELSE
+     RAISE EXCEPTION 'Unknown country: % (use pl/cz)', p_country;
+   END IF;
+
+   IF NOT FOUND THEN
+     RAISE EXCEPTION 'Job counters row not found for country % and ID %', p_country, v_jobid;
+   END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION jobs.upsert_jobdict(
+    p_title_en text,
+    p_skill_en text,
+    p_local_title text,
+    p_local_skill text,
+    p_language varchar
+)
+RETURNS int AS $$
+DECLARE
+    v_jobid int;
+BEGIN
+    SELECT jobid INTO v_jobid 
+    FROM jobs.jobdict 
+    WHERE title_en ~* ('^\s*' || p_title_en || '\s*$')
+      AND skill_en ~* ('^\s*' || p_skill_en || '\s*$')
+    LIMIT 1;
+
+    IF v_jobid IS NULL THEN
+        INSERT INTO jobs.jobdict (title_en, skill_en)
+        VALUES (btrim(p_title_en), btrim(p_skill_en))
+        RETURNING jobid INTO v_jobid;
+    END IF;
+
+    INSERT INTO jobs.jobtranslations (jobid, language, local_title, local_skill)
+    VALUES (v_jobid, p_language, btrim(p_local_title), btrim(p_local_skill))
+    ON CONFLICT (jobid, language) DO UPDATE 
+    SET local_title = EXCLUDED.local_title,
+        local_skill = EXCLUDED.local_skill;
+
+    RETURN v_jobid;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION jobs.get_en_by_local(p_title text, p_skill text)
+ RETURNS TABLE(title_en character varying, skill_en character varying)
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  RETURN QUERY
+  SELECT jd.title_en, jd.skill_en
+  FROM jobs.jobdict jd
+  JOIN jobs.jobtranslations jt USING (jobid)
+  WHERE jt.local_title ~* ('^\s*' || p_title || '\s*$')
+    AND jt.local_skill ~* ('^\s*' || p_skill || '\s*$');
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Nie znaleziono tlumaczenia dla: %, %', p_title, p_skill;
+  END IF;
+END;
+
+CREATE OR REPLACE FUNCTION users.fn_validate_search_distance()
+RETURNS trigger AS $$
+DECLARE
+    v_max_dist int;
+BEGIN
+    SELECT r.maxdistance INTO v_max_dist
+    FROM users.regions r
+    WHERE r.country = NEW.country
+      AND r.region = NEW.region;
+
+    IF v_max_dist IS NULL THEN
+        RAISE EXCEPTION 'Region % w kraju % nie istnieje', NEW.region, NEW.country;
+    END IF;
+
+    IF NOT (NEW.distance < v_max_dist) THEN
+        RAISE EXCEPTION 'Dystans (%) musi byc mniejszy niz limit regionu (%)', 
+            NEW.distance, v_max_dist;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_users_validate_search_distance ON users.usersearchsettings;
+CREATE TRIGGER trg_users_validate_search_distance
+BEFORE INSERT OR UPDATE OF distance, country, region ON users.usersearchsettings
+FOR EACH ROW
+EXECUTE FUNCTION users.fn_validate_search_distance();
+
+COMMIT;
